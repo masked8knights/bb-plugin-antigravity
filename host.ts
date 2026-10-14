@@ -392,7 +392,8 @@ const handlers: Record<string, RequestHandler> = {
     io.sendResult(id, {
       protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
       capabilities: {
-        grammarVersions: [THREAD_DELTA_GRAMMAR_V3],
+        // bb requires >=2 advertised grammar versions; agy only implements v3.
+        grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
         sessionRestore: false,
         threadArchive: false,
         threadRename: false,
