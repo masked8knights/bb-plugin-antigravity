@@ -1,37 +1,26 @@
-// bb-plugin-antigravity — run bb threads on Google Antigravity over ACP.
+// bb-plugin-antigravity — run bb threads on Google Antigravity.
 //
-// Antigravity's `agy` CLI has no ACP mode of its own, so this plugin downloads
-// a stdio adapter, wraps it with a model-normalizing shim, and registers
-// `acp-antigravity` with bb's ACP bridge. On bb 0.41 that means writing the
-// builtin provider-acp plugin's `customAgents` setting; older bb still reads
-// `customAcpAgents` from config.json, so both are kept in sync.
+// Self-registers the "antigravity" provider through the SDK provider API;
+// turns are bridged by this plugin's host artifact, which shells out to the
+// local `agy` CLI (`agy -p ... --output-format json`) per turn. No builtin
+// provider-acp registration is involved.
 
-import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-import { installAdapter } from "./adapter-install.js";
-import {
-  ADAPTER_BINARIES,
-  ADAPTER_INSTALL_HINT,
-  AGY_BINARY,
-  type Options,
-  type Status,
-  type Transport,
-  bootstrap,
-  disable,
-  doctor,
-  enable,
-  readStatus,
-  syncSkillsToGemini,
-} from "./antigravity.js";
-import { resolveDataDir } from "./config.js";
-import { findExecutable, findFirstExecutable } from "./discover.js";
-import { waitForProviderAcp } from "./provider-ready.js";
+import { antigravityHostContract } from "./contract.js";
 
 const OPTED_OUT_KEY = "optedOut";
+const PROVIDER_ID = "antigravity";
+const AGY_BINARY = "agy";
+const BRIDGE_CONFIG_PATH = join(tmpdir(), "bb-plugin-antigravity", "config.json");
 
 const statusSchema = z.object({
   providerId: z.string(),
@@ -75,280 +64,342 @@ export const rpcContract = defineRpcContract({
   },
 });
 
-export default async function plugin(bb: BbPluginApi) {
-  const pluginRoot = path.dirname(fileURLToPath(import.meta.url));
-  const registry = bb.sdk.plugins;
+function runNoStdin(bin: string, args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`${bin} ${args.join(" ")} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString();
+    });
+    child.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`${bin} ${args.join(" ")} exited ${code}: ${stderr.slice(0, 400)}`));
+    });
+  });
+}
 
+/** Same candidate scan the old adapter path used: absolute override, PATH, then known install dirs. */
+function findAgy(configured: string): string | undefined {
+  const names = process.platform === "win32" ? ["agy.exe", "agy.cmd", "agy"] : ["agy"];
+  const check = (dir: string): string | undefined => {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  };
+  if (configured.trim()) {
+    const raw = configured.trim();
+    if (path.isAbsolute(raw)) {
+      if (existsSync(raw)) return raw;
+      if (process.platform === "win32" && existsSync(`${raw}.exe`)) return `${raw}.exe`;
+      return undefined;
+    }
+    for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+      if (!dir) continue;
+      const hit = check(dir);
+      if (hit && path.basename(hit).toLowerCase().startsWith(AGY_BINARY)) return hit;
+    }
+  }
+  const localAppData = process.env.LOCALAPPDATA ?? "";
+  const homes = [homedir(), process.env.HOME ?? homedir()];
+  const dirs = [
+    ...(localAppData ? [join(localAppData, "agy", "bin")] : []),
+    ...homes.map((h) => join(h, ".local", "bin")),
+    ...homes.map((h) => join(h, ".agy", "bin")),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  for (const dir of dirs) {
+    const hit = check(dir);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+let modelProbe: { at: number; count: number } | null = null;
+
+async function probeAgy(agyPath: string): Promise<{ version?: string; modelCount?: number; error?: string }> {
+  let version: string | undefined;
+  try {
+    version = (await runNoStdin(agyPath, ["--version"], 10_000)).trim().split("\n")[0];
+  } catch {
+    version = undefined;
+  }
+  if (modelProbe && Date.now() - modelProbe.at < 5 * 60_000) {
+    return { version, modelCount: modelProbe.count };
+  }
+  try {
+    const stdout = await runNoStdin(agyPath, ["models"], 30_000);
+    const count = stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && line.includes("\t")).length;
+    modelProbe = { at: Date.now(), count };
+    return { version, modelCount: count };
+  } catch (error) {
+    return { version, error: (error as Error).message };
+  }
+}
+
+export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    agentId: {
+    agyBin: {
       type: "string",
-      label: "Agent id",
-      default: "antigravity",
-      description: "bb exposes this as provider id acp-<id>.",
+      label: "agy binary path",
+      default: "",
+      description: "Absolute path to the agy CLI. Empty auto-detects (PATH, %LOCALAPPDATA%\\agy\\bin, ~/.local/bin).",
     },
-    displayName: {
+    model: {
       type: "string",
-      label: "Display name",
-      default: "Antigravity",
-      description: "Shown in the provider picker.",
+      label: "Default model id (blank = agy default)",
+      default: "",
     },
-    transport: {
+    effort: {
       type: "select",
-      label: "Transport",
-      options: ["connect", "cli"],
-      default: "connect",
-      description:
-        "connect holds one agy language server warm (~1.3s/turn, per-tool-call " +
-        "permission prompts). cli spawns agy per turn (~3.4s/turn, blanket " +
-        "per-turn permission) and is the fallback if the private API breaks.",
-    },
-    adapterCommand: {
-      type: "string",
-      label: "Adapter path",
-      default: "",
-      description: `Absolute path to the ACP adapter. Empty auto-detects ${ADAPTER_BINARIES.join(", then ")}.`,
-    },
-    agyCommand: {
-      type: "string",
-      label: "agy path",
-      default: "",
-      description: `Absolute path to the ${AGY_BINARY} CLI. Empty means auto-detect.`,
-    },
-    compatibilityShim: {
-      type: "boolean",
-      label: "Compatibility & Model Normalization Shim",
-      default: true,
-      description:
-        "Wrap the adapter to normalize models into clean families and provide native " +
-        "reasoning effort (Low / Medium / High) in the composer picker.",
-    },
-    autoContinue: {
-      type: "boolean",
-      label: "Auto-continue when Antigravity yields",
-      default: true,
-      description:
-        "agy-acp ends the ACP turn when print-mode agy exits. If the last " +
-        "assistant text says it is waiting on background work, send Continue on " +
-        "the same session instead of going idle.",
+      label: "Default reasoning effort (only used when no specific model is picked)",
+      options: ["low", "medium", "high"],
+      default: "medium",
     },
   });
 
-  async function options(): Promise<Options> {
+  const hostClient = bb.hosts.experimental_client({ contract: antigravityHostContract });
+
+  function resolveAgyBin(configured: string): string {
+    return findAgy(configured) ?? configured.trim() ?? AGY_BINARY;
+  }
+
+  async function pushConfigToHost(hostId: string, signal: AbortSignal): Promise<void> {
     const current = await settings.get();
+    try {
+      await hostClient.call(
+        "setConfig",
+        {
+          agyBin: resolveAgyBin(current.agyBin),
+          model: current.model,
+          effort: current.effort as "low" | "medium" | "high",
+        },
+        { hostId, signal },
+      );
+    } catch {
+      // A disconnect can race the connected-host snapshot; the reconciler
+      // retries on the next request or host:changed event.
+    }
+  }
+
+  let requestConfigReconcile = () => {};
+  settings.onChange(() => {
+    requestConfigReconcile();
+  });
+
+  bb.background.service("host-config-reconciler", {
+    async start(signal) {
+      let reconcileRequested = true;
+      let wake: (() => void) | null = null;
+      requestConfigReconcile = () => {
+        reconcileRequested = true;
+        wake?.();
+      };
+      const unsubscribeHost = bb.sdk.subscribe({
+        event: "host:changed",
+        callback: (event) => {
+          if (event.changes.includes("host-connected")) requestConfigReconcile();
+        },
+      });
+      try {
+        while (!signal.aborted) {
+          if (reconcileRequested) {
+            reconcileRequested = false;
+            const hosts = await bb.sdk.hosts.list({ signal });
+            await Promise.all(
+              hosts
+                .filter((host) => host.status === "connected")
+                .map((host) => pushConfigToHost(host.id, signal)),
+            );
+          }
+          if (signal.aborted) break;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          wake = null;
+        }
+      } finally {
+        requestConfigReconcile = () => {};
+        unsubscribeHost();
+      }
+    },
+  });
+
+  let registration: { dispose(): void } | null = null;
+
+  function registerProvider(): void {
+    if (registration) return;
+    registration = bb.providers.register({
+      id: PROVIDER_ID,
+      displayName: "Antigravity",
+      icon: "./icons/antigravity.svg",
+      models: { scope: "host" },
+      capabilities: {
+        supportsServiceTier: false,
+        supportsNativeUserQuestion: false,
+        fork: "none",
+        supportsManualCompaction: false,
+        supportsThreadArchive: false,
+        supportsThreadRename: false,
+        permissionModes: ["full"],
+        // The model list is collapsed to one entry per model, so bb renders a
+        // separate reasoning-effort picker (low/medium/high); the bridge
+        // re-encodes the selection into the full agy model id at turn time.
+        reasoningLevels: ["low", "medium", "high"],
+      },
+      composerActions: [],
+    });
+  }
+
+  function unregisterProvider(): void {
+    registration?.dispose();
+    registration = null;
+  }
+
+  if (await bb.storage.kv.get<boolean>(OPTED_OUT_KEY)) {
+    bb.log.info("provider registration skipped — disabled on purpose");
+  } else {
+    registerProvider();
+  }
+
+  async function currentStatus(): Promise<z.infer<typeof statusSchema>> {
+    const current = await settings.get();
+    const agyPath = findAgy(current.agyBin);
+    let agy: z.infer<typeof statusSchema>["agy"];
+    if (agyPath) {
+      const probe = await probeAgy(agyPath);
+      const authState =
+        probe.modelCount !== undefined && probe.modelCount > 0
+          ? "ok"
+          : probe.error && /auth|login|unauthor/i.test(probe.error)
+            ? "failed"
+            : "unknown";
+      agy = {
+        path: agyPath,
+        version: probe.version,
+        authState,
+        modelCount: probe.modelCount,
+        error: probe.error,
+      };
+    }
     return {
-      agentId: current.agentId,
-      displayName: current.displayName,
-      transport: current.transport as Transport,
-      adapterCommand: current.adapterCommand,
-      agyCommand: current.agyCommand,
-      compatibilityShim: current.compatibilityShim,
-      autoContinue: current.autoContinue,
+      providerId: PROVIDER_ID,
+      dataDir: path.dirname(BRIDGE_CONFIG_PATH),
+      configPath: BRIDGE_CONFIG_PATH,
+      enabled: registration !== null,
+      transport: "agy -p json bridge",
+      agyMissing: !agyPath,
+      adapterMissing: false,
+      pickerRegistered: registration !== null,
+      agy,
     };
   }
 
-  async function reloadServerConfig(): Promise<void> {
-    await bb.sdk.system.reloadConfig();
-  }
-
-  async function currentStatus(): Promise<Status> {
-    return await readStatus(await options(), dataDir, { registry });
-  }
-
-  const dataDir = resolveDataDir();
-
-  const [agyPath, adapterPath] = await Promise.all([
-    findExecutable(AGY_BINARY),
-    findFirstExecutable(ADAPTER_BINARIES),
-  ]);
-  if (!agyPath) {
-    bb.status.needsConfiguration(
-      `Missing ${AGY_BINARY} CLI. Install it with \`curl -fsSL https://antigravity.google/cli/install.sh | bash\`, then reload.`,
-    );
-  }
-
   bb.rpc.register(rpcContract, {
-    status: async () => toWire(await currentStatus()),
+    status: async () => currentStatus(),
     enable: async () => {
-      try {
-        await bb.storage.kv.delete(OPTED_OUT_KEY);
-        const result = await enable(
-          await options(),
-          dataDir,
-          pluginRoot,
-          reloadServerConfig,
-          { registry },
-        );
-        return {
-          ok: true,
-          message: result.reloaded
-            ? `${result.providerId} is available in the provider picker.`
-            : `Wrote ${result.providerId}. Reload failed (${result.reloadError}); restart bb to apply.`,
-          status: toWire(await currentStatus()),
-        };
-      } catch (error) {
-        return { ok: false, message: (error as Error).message };
-      }
+      await bb.storage.kv.delete(OPTED_OUT_KEY);
+      registerProvider();
+      requestConfigReconcile();
+      return {
+        ok: true,
+        message: `${PROVIDER_ID} is registered by this plugin — it is in the provider picker.`,
+        status: await currentStatus(),
+      };
     },
     disable: async () => {
-      try {
-        await bb.storage.kv.set(OPTED_OUT_KEY, true);
-        const result = await disable(
-          await options(),
-          dataDir,
-          reloadServerConfig,
-          { registry },
-        );
-        return {
-          ok: true,
-          message: result.removed
-            ? "Removed the Antigravity provider."
-            : "Nothing to remove.",
-          status: toWire(await currentStatus()),
-        };
-      } catch (error) {
-        return { ok: false, message: (error as Error).message };
-      }
+      await bb.storage.kv.set(OPTED_OUT_KEY, true);
+      unregisterProvider();
+      return {
+        ok: true,
+        message: `Unregistered ${PROVIDER_ID} from the provider picker (until re-enabled or reload).`,
+        status: await currentStatus(),
+      };
     },
   });
 
   bb.cli.register({
     name: "antigravity",
-    summary: "Run bb threads on Google Antigravity over ACP",
+    summary: "Run bb threads on Google Antigravity via the self-registered provider bridge",
     commands: [
       {
         name: "status",
-        summary: "Show whether the Antigravity ACP provider is wired up",
+        summary: "Show whether the Antigravity provider is registered and agy is reachable",
         usage: "bb antigravity status [--json]",
       },
       {
         name: "doctor",
-        summary:
-          "Check the agy CLI, its subscription, and the ACP adapter handshake",
+        summary: "Check the agy CLI, its subscription, and the bridge config",
         usage: "bb antigravity doctor [--json]",
       },
       {
-        name: "install",
-        summary:
-          "Download agy-acp if needed and register the provider in the picker",
-        usage: "bb antigravity install [--force] [--json]",
-      },
-      {
         name: "enable",
-        summary: "Register the Antigravity ACP provider with bb",
+        summary: "Register the Antigravity provider with bb",
         usage: "bb antigravity enable",
       },
       {
         name: "disable",
-        summary: "Remove the Antigravity ACP provider from bb",
+        summary: "Unregister the Antigravity provider from bb",
         usage: "bb antigravity disable",
       },
     ],
     async run(argv) {
       const json = argv.includes("--json");
-      const force = argv.includes("--force");
       const positional = argv.filter((arg) => !arg.startsWith("-"));
       const subcommand = positional[0] ?? "status";
-      const current = await options();
 
       try {
         switch (subcommand) {
           case "status": {
-            const status = await readStatus(current, dataDir, { registry });
+            const status = await currentStatus();
             return json
-              ? ok(JSON.stringify(toWire(status), null, 2))
+              ? ok(JSON.stringify(status, null, 2))
               : ok(renderStatus(status));
           }
-
           case "doctor": {
-            const report = await doctor(current, dataDir, pluginRoot, { registry });
-            return json
-              ? ok(
-                  JSON.stringify(
-                    { ...report, status: toWire(report.status) },
-                    null,
-                    2,
-                  ),
-                )
-              : ok(renderDoctor(report.status, report.handshake));
-          }
-
-          case "install": {
-            const adapter = await installAdapter({ force });
-            await bb.storage.kv.delete(OPTED_OUT_KEY);
-            const result = await enable(
-              current,
-              dataDir,
-              pluginRoot,
-              reloadServerConfig,
-              { registry },
-            );
-            if (json) {
-              return ok(
-                JSON.stringify(
-                  {
-                    adapter,
-                    providerId: result.providerId,
-                    pickerWrote: result.pickerWrote ?? null,
-                    reloaded: result.reloaded,
-                  },
-                  null,
-                  2,
-                ),
-              );
+            const status = await currentStatus();
+            const lines = [renderStatus(status)];
+            if (status.agy) {
+              lines.push(`Bridge   ${existsSync(BRIDGE_CONFIG_PATH) ? BRIDGE_CONFIG_PATH : "config not pushed yet"}`);
             }
-            return ok(renderEnable(result, adapter.path));
+            return json ? ok(JSON.stringify(status, null, 2)) : ok(lines.join("\n"));
           }
-
           case "enable": {
             await bb.storage.kv.delete(OPTED_OUT_KEY);
-            const result = await enable(
-              current,
-              dataDir,
-              pluginRoot,
-              reloadServerConfig,
-              { registry },
-            );
-            return json
-              ? ok(
-                  JSON.stringify(
-                    {
-                      providerId: result.providerId,
-                      pickerWrote: result.pickerWrote ?? null,
-                      reloaded: result.reloaded,
-                      adapter: result.adapterInstall ?? null,
-                    },
-                    null,
-                    2,
-                  ),
-                )
-              : ok(renderEnable(result));
+            registerProvider();
+            requestConfigReconcile();
+            return ok(`${PROVIDER_ID} registered. Try:\n  bb thread spawn --provider ${PROVIDER_ID} --prompt "..."`);
           }
-
           case "disable": {
             await bb.storage.kv.set(OPTED_OUT_KEY, true);
-            const result = await disable(
-              current,
-              dataDir,
-              reloadServerConfig,
-              { registry },
-            );
-            if (!result.removed) {
-              return ok(`No Antigravity entry in ${result.configPath}.`);
-            }
-            return ok(
-              `Removed the Antigravity provider from ${result.configPath}.` +
-                (result.reloaded
-                  ? ""
-                  : `\nConfig reload failed (${result.reloadError}). Restart bb to apply.`),
-            );
+            unregisterProvider();
+            return ok(`Unregistered ${PROVIDER_ID}.`);
           }
-
           default:
             return {
               exitCode: 2,
               stderr:
                 `Unknown subcommand "${subcommand}".\n` +
-                "Usage: bb antigravity <status|doctor|install|enable|disable> [--json]\n",
+                "Usage: bb antigravity <status|doctor|enable|disable> [--json]\n",
             };
         }
       } catch (error) {
@@ -357,48 +408,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.background.service("auto-setup", {
-    async start(signal) {
-      if (signal.aborted) return;
-      if (await bb.storage.kv.get<boolean>(OPTED_OUT_KEY)) {
-        bb.log.info("auto-setup skipped — provider was disabled on purpose");
-        return;
-      }
-      try {
-        await waitForProviderAcp(registry, signal);
-        const result = await bootstrap(
-          await options(),
-          dataDir,
-          pluginRoot,
-          reloadServerConfig,
-          { registry },
-        );
-        if (result.skipped && result.reason && result.status.agyMissing) {
-          bb.status.needsConfiguration(result.reason);
-          bb.log.warn(result.reason);
-          return;
-        }
-        if (result.skipped) {
-          bb.log.info(`auto-setup skipped (${result.reason ?? "already registered"})`);
-          await syncSkillsToGemini(dataDir);
-          return;
-        }
-        bb.log.info(
-          `auto-setup registered ${result.apply?.providerId}` +
-            (result.apply?.adapterInstall?.downloaded ? " and downloaded agy-acp" : ""),
-        );
-        await syncSkillsToGemini(dataDir);
-      } catch (error) {
-        if (signal.aborted) return;
-        const message = (error as Error).message;
-        bb.log.warn(`auto-setup failed: ${message}`);
-        bb.status.needsConfiguration(message);
-      }
-    },
-  });
-
   bb.agents.configure((context) => {
-    if (context.provider.id !== "acp-antigravity") {
+    if (context.provider.id !== PROVIDER_ID) {
       return { tools: [], skills: [] };
     }
     return {
@@ -415,133 +426,47 @@ export default async function plugin(bb: BbPluginApi) {
     };
   });
 
-  bb.log.info(
-    `ready (agy: ${agyPath ?? "missing"}, adapter: ${adapterPath ?? "missing"})`,
-  );
+  const initial = await settings.get();
+  const agyPath = findAgy(initial.agyBin);
+  if (!agyPath) {
+    bb.status.needsConfiguration(
+      `Missing ${AGY_BINARY} CLI. Install it with \`curl -fsSL https://antigravity.google/cli/install.sh | bash\`, then reload.`,
+    );
+  }
+  bb.log.info(`ready (provider: ${PROVIDER_ID}, agy: ${agyPath ?? "missing"})`);
+
+  bb.onDispose(() => {
+    unregisterProvider();
+    bb.log.info("disposed");
+  });
 }
 
 function ok(stdout: string): { exitCode: number; stdout: string } {
   return { exitCode: 0, stdout: stdout.endsWith("\n") ? stdout : `${stdout}\n` };
 }
 
-/** Drop the full entry — the wire type only carries what the UI renders. */
-function toWire(status: Status): z.infer<typeof statusSchema> {
-  const { entry: _entry, ...rest } = status;
-  return rest;
-}
-
-function adapterLaunchPath(entry: {
-  command: string;
-  args?: string[];
-}): string {
-  const shimmed = entry.command.includes("antigravity-acp-shim");
-  if (shimmed) return entry.args?.[0] ?? entry.command;
-  return entry.command;
-}
-
-function renderEnable(
-  result: {
-    providerId: string;
-    configPath: string;
-    entry: { command: string; args?: string[]; env?: Record<string, string> };
-    reloaded: boolean;
-    reloadError?: string;
-    adapterInstall?: { path: string; downloaded: boolean };
-    pickerWrote?: boolean;
-  },
-  adapterOverride?: string,
-): string {
-  const adapter =
-    adapterOverride ??
-    result.adapterInstall?.path ??
-    adapterLaunchPath(result.entry);
-  const shimmed = result.entry.command.includes("antigravity-acp-shim");
+function renderStatus(status: z.infer<typeof statusSchema>): string {
   const lines = [
-    `Registered ${result.providerId} in ${result.configPath}`,
-    `  adapter   ${adapter}`,
-    ...(result.adapterInstall?.downloaded ? ["  adapter   downloaded"] : []),
-    ...(shimmed ? [`  shim      ${result.entry.command}`] : []),
-    `  AGY_BIN   ${result.entry.env?.AGY_BIN}`,
-    result.pickerWrote === false
-      ? "  picker    already listed"
-      : "  picker    provider-acp customAgents",
-    result.reloaded
-      ? `\n${result.providerId} is now in the provider picker. Try:\n  bb thread spawn --provider ${result.providerId} --prompt "..."`
-      : `\nConfig reload failed (${result.reloadError}). Restart bb to apply.`,
-  ];
-  return lines.join("\n");
-}
-
-function renderStatus(status: Status): string {
-  const picker =
-    status.pickerRegistered === true
-      ? "in picker"
-      : status.pickerRegistered === false
-        ? "not in picker"
-        : status.enabled
-          ? "registered"
-          : "not registered";
-  const lines = [
-    `Provider   ${status.providerId}  ${picker}`,
-    `Config     ${status.configPath}`,
+    `Provider   ${status.providerId}  ${status.pickerRegistered ? "in picker" : "not in picker"}`,
     `Transport  ${status.transport}`,
+    `Config     ${status.configPath}`,
   ];
-
   lines.push(
     status.agy
       ? `agy        ${status.agy.path}${status.agy.version ? ` (${status.agy.version})` : ""}` +
           `\n           ${renderAuth(status.agy)}`
       : `agy        MISSING — curl -fsSL https://antigravity.google/cli/install.sh | bash`,
   );
-
-  lines.push(
-    status.adapterPath
-      ? `adapter    ${status.adapterPath}`
-      : `adapter    MISSING — ${ADAPTER_INSTALL_HINT}`,
-  );
-
-  if (status.drift) {
-    lines.push(
-      `\nThe registered entry is stale: ${status.drift}.\nRun \`bb antigravity enable\` to rewrite it.`,
-    );
-  }
-
-  if (!status.enabled && status.agyMissing) {
-    lines.push(
-      "\nInstall and log into agy, then run `bb antigravity enable` (or reload the plugin).",
-    );
-  }
-
   return lines.join("\n");
 }
 
-function renderAuth(agy: NonNullable<Status["agy"]>): string {
+function renderAuth(agy: NonNullable<z.infer<typeof statusSchema>["agy"]>): string {
   switch (agy.authState) {
     case "ok":
       return `subscription live, ${agy.modelCount} models`;
     case "failed":
       return `NOT authenticated${agy.error ? ` — ${agy.error}` : ""} — run \`agy\` once to log in`;
     default:
-      return (
-        "auth unverified from the bb server process (its keychain reach differs " +
-        "from the host daemon that launches the agent) — not a blocker"
-      );
+      return agy.error ? `models probe failed — ${agy.error}` : "models probe pending";
   }
-}
-
-function renderDoctor(
-  status: Status,
-  handshake?: { ok: boolean; agentName?: string; version?: string; error?: string },
-): string {
-  const lines = [renderStatus(status), ""];
-  if (!handshake) {
-    lines.push("ACP        skipped — the adapter was not found.");
-  } else if (handshake.ok) {
-    lines.push(
-      `ACP        handshake ok — ${handshake.agentName ?? "agent"} ${handshake.version ?? ""}`.trimEnd(),
-    );
-  } else {
-    lines.push(`ACP        handshake FAILED — ${handshake.error}`);
-  }
-  return lines.join("\n");
 }
